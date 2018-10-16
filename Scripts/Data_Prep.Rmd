@@ -1,0 +1,332 @@
+---
+title: "ML Proj"
+output: html_notebook
+---
+
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+options(scipen=999)
+library(bit64)
+library(tidyr)
+library(Amelia)
+library(data.table)
+library(dplyr)
+library(stringi)
+library(stringr)
+library(rlang)
+library(zoo)
+library(Amelia)
+library(rpart)
+library(rpart.plot)
+library(readxl)
+```
+
+############################################################
+##################### Importing Data #######################
+############################################################
+
+Globals and Raw Data Imports
+```{r}
+acq.col.names <- c("LOAN_ID", "ORIG_CHN", "Seller.Name", "ORIG_RT", "ORIG_AMT", "ORIG_TRM", "ORIG_DTE",
+                   "FRST_DTE", "OLTV", "OCLTV", "NUM_BO", "DTI", "CSCORE_B", "FTHB_FLG", "PURPOSE", "PROP_TYP",
+                   "NUM_UNIT", "OCC_STAT", "STATE", "ZIP_3", "MI_PCT", "Product.Type", "CSCORE_C", "MI_TYPE", "RELOCATION_FLG")
+
+perf.col.names = c("LOAN_ID", "Monthly.Rpt.Prd", "Servicer.Name", "LAST_RT", "LAST_UPB", "Loan.Age", "Months.To.Legal.Mat", 
+                   "Adj.Month.To.Mat", "Maturity.Date", "MSA", "Delq.Status", "MOD_FLAG", "Zero.Bal.Code", "ZB_DTE", "LPI_DTE", 
+                   "FCC_DTE","DISP_DT", "FCC_COST", "PP_COST", "AR_COST", "IE_COST", "TAX_COST", "NS_PROCS", "CE_PROCS", "RMW_PROCS", 
+                   "O_PROCS", "NON_INT_UPB", "PRIN_FORG_UPB_FHFA", "REPCH_FLAG", "PRIN_FORG_UPB_OTH", "TRANSFER_FLG")
+
+acq.raw <- fread(file = "../Data/Acquisition_2000Q1.txt", sep = "|", col.names = acq.col.names, showProgress = F)
+
+perf.raw = fread(file = "../Data/Performance_2000Q1.txt", sep = "|", col.names = perf.col.names, showProgress = F)
+
+#use spread of 15 and 30 year to calculate the rest, source is from the FED
+ir.df = read.csv(file = "../Data//IR_Data.csv") %>% 
+  select(Date, FRM15 = one_of("X15_Year_FRM"), FRM30 = one_of("X30_Year_FRM")) %>% 
+  mutate(Date = as.Date(as.yearmon(Date, "%b-%y")),
+         FRM15 = FRM15/100, 
+         FRM30 = FRM30/100, 
+         FRM10 = FRM30 - (FRM30 - FRM15)/3*4,
+         FRM20 = FRM30 - (FRM30 - FRM15)/3*2,
+         FRM25 = FRM30 - (FRM30 - FRM15)/3*1) %>% 
+  select(Date, FRM10, FRM15, FRM20, FRM25, FRM30)
+
+#State to Division to Region Mapping for HPI Data
+str.df = read.csv(file = "../Data/State_Division_Region.txt", header = T, stringsAsFactors = F) %>% 
+  select(State = one_of("State.Code"), Division) %>% 
+  mutate(Division = str_replace_all(string = Division, pattern = " ", replacement = "_"))
+
+#Create colname string to use for HPI historical import
+uniq.str1 = c(unique(str.df$Division) %>% sort()) 
+uniq.str2 = c(unique(str.df$Division) %>% sort()) 
+
+str.col.names = NULL
+for( i in 1:length(uniq.str1)) {
+  
+  hold1 = c(paste0(c(unlist(strsplit(uniq.str1[i], " ")), "NSA") ,collapse = "_"))
+  hold2 = c(paste0(c(unlist(strsplit(uniq.str2[i], " ")), "SA") ,collapse = "_"))
+  
+  if(i != max(length(uniq.str1))) {
+  str.col.names = c(str.col.names, hold1, hold2)
+  } else {
+  str.col.names = c("Date", str.col.names, hold1, hold2, "USA_NSA", "USA_SA")
+  }
+  
+}
+
+#Import Division HPI Historical, from FHFA
+hpi.df = read.csv(file = "../Data/HPI.csv", col.names = str.col.names) %>% 
+  mutate(Date = as.Date(Date %>% as.character(), format("%m/%d/%Y")))
+
+```
+
+##################################################################
+##################### Acquisition Clean-Up #######################
+##################################################################
+
+acquisition clean up
+```{r}
+
+# best way to handle LTV (OLTV and OCLTV) score - view features
+# OCLTV has majority as nulls, DTI 11k nulls
+# impute NUM_BO from CSCORE_C - otherwise rm
+# removing all skewed/low observations
+# OCLTV has majority as nulls, DTI 11k nulls
+# remove where FICO scores do not exist in either
+# any number of borrowers >= 3 => 3
+# see if num_bo as factor provides better results
+# figure out how to impute missing DTI
+
+#Values with NA still
+# Impute DTI from other factors   -    table(is.na(acq.df$DTI))
+
+acq.df = acq.raw %>%
+  select(LOAN_ID, FRST_DTE, ORIG_DTE, ORIG_TRM, ORIG_RT, ORIG_AMT, CSCORE_B, CSCORE_C, OCLTV, OLTV, 
+         DTI, MI_PCT, FTHB_FLG, PURPOSE, OCC_STAT, NUM_BO, NUM_UNIT, RELOCATION_FLG, STATE) %>%              
+  filter(FTHB_FLG != "U", PURPOSE != "U", !is.na(acq.raw$CSCORE_B) | !is.na(acq.raw$CSCORE_C),                                             
+         ORIG_TRM %in% c(120, 180, 240, 300, 360)) %>% 
+  mutate(#Imputing Values
+    FICO_B = ifelse(is.na(CSCORE_B), CSCORE_C, CSCORE_B),
+    CSCORE_B_NA_HOLD = ifelse(is.na(CSCORE_B), 0, CSCORE_B),
+    CSCORE_C_NA_HOLD = ifelse(is.na(CSCORE_C), 0, CSCORE_C),
+    FICO_C = factor(ifelse(CSCORE_B_NA_HOLD == CSCORE_C_NA_HOLD | FICO_B == CSCORE_C_NA_HOLD, "null",
+                                  ifelse(CSCORE_B_NA_HOLD < CSCORE_C_NA_HOLD & FICO_B != CSCORE_C_NA_HOLD, "positive", "negative")), 
+                    levels = c("negative", "null", "positive")),
+    FINAL_LTV = ifelse(!is.na(OCLTV), OCLTV, OLTV),
+    MI_PCT = (ifelse(is.na(MI_PCT), 0, MI_PCT))/100, 
+    NUM_BO = ifelse(!is.na(OCLTV), 2, ifelse(NUM_BO >= 4, 4, NUM_BO)),
+    #Specify Correct Variable Types
+    LOAN_ID = LOAN_ID %>% as.character(),                                                         
+    FRST_DTE = base::as.Date(paste0("01/",FRST_DTE), "%d/%m/%Y"),                                 
+    ORIG_DTE = base::as.Date(paste0("01/",ORIG_DTE), "%d/%m/%Y"),
+    ORIG_TRM = factor(ORIG_TRM, c(120, 180, 240, 300, 360)),
+    FTHB_FLG = factor(FTHB_FLG, c("N", "Y")),
+    PURPOSE = factor(PURPOSE, c("R", "C", "P")),
+    OCC_STAT = factor(OCC_STAT, c("I", "S", "P")),
+    NUM_UNIT = ifelse(NUM_UNIT > 3, ">=4", NUM_UNIT) %>% as.character(), 
+    NUM_UNIT = factor(NUM_UNIT, c("1", "2", "3", ">=4")),
+    RELOCATION_FLG = factor(RELOCATION_FLG, c("N","Y"))) %>% 
+  filter(!is.na(FINAL_LTV)) %>% 
+  select(LOAN_ID, STATE, ORIG_TRM, ORIG_RT, ORIG_AMT, CSCORE_B, CSCORE_C, 
+         FICO_B, FICO_C, OCLTV, OLTV, FINAL_LTV, DTI, MI_PCT, FTHB_FLG, 
+         PURPOSE, OCC_STAT, NUM_BO, NUM_UNIT, RELOCATION_FLG, FICO_B, FICO_C) %>% 
+  arrange(LOAN_ID)
+
+```
+
+##################################################################
+##################### Performance Clean-Up #######################
+##################################################################
+
+```{r}
+# ZB_CODE:
+# 01/16 - Prepaid/Matured
+# 02/03/09/15/ - Default
+# 06 - mixed
+# End UPB: 
+
+# Remove any modified loans  -  maybe not
+# remove loan age <= 0 
+# remove any dlq status > 6   ---- see what happens to mod_Flags and non interest bearing upb
+# carry zb_code over to the individual loans
+# put del_stat = 0 if zb_code = 1
+# determine UPB and market rates after incorporating acquisition data
+
+#remove loans that have values for NON_INT_UPB, PRIN_FORG_UPB_FHFA, PRIN_FORG_UPB_OTH
+rm.LOAN_ID = perf.raw %>% 
+  filter(!is.na(NON_INT_UPB) | !is.na(PRIN_FORG_UPB_FHFA) | !is.na(PRIN_FORG_UPB_OTH),
+         NON_INT_UPB != 0 | PRIN_FORG_UPB_FHFA != 0 | PRIN_FORG_UPB_OTH != 0 ) %>% 
+  mutate(LOAN_ID = as.character(LOAN_ID)) %>% 
+  distinct(LOAN_ID,.keep_all = T)
+
+perf.1 <- perf.raw %>% 
+  #rename column headers and keep only needed variables
+  select(LOAN_ID, MTH_RPT_PRD = one_of("Monthly.Rpt.Prd"), MAT_DT = one_of("Maturity.Date"), LOAN_AGE = one_of("Loan.Age"),
+         FCC_DTE, DISP_DT, ZB_DTE, ZB_CODE = one_of("Zero.Bal.Code"), DLQ_STAT = one_of("Delq.Status"), 
+         LAST_RT, LAST_UPB, NON_INT_UPB, PRIN_FORG_UPB_FHFA, PRIN_FORG_UPB_OTH, MOD_FLAG) %>% 
+  #Specify Correct Variable Types
+  mutate(DLQ_STAT = ifelse(DLQ_STAT == "X", "999", DLQ_STAT) %>% as.numeric(),
+         LOAN_ID = as.character(LOAN_ID), 
+         MTH_RPT_PRD = base::as.Date(MTH_RPT_PRD, "%m/%d/%Y"),
+         MAT_DT = as.Date(as.yearmon(MAT_DT, "%m/%Y")),
+         FCC_DTE = base::as.Date(FCC_DTE, "%m/%d/%Y"),
+         DISP_DT = base::as.Date(DISP_DT, "%m/%d/%Y"),
+         ZB_DTE = as.Date(as.yearmon(ZB_DTE, "%m/%Y")),
+         MOD_FLAG = factor(MOD_FLAG, c("N", "Y"))
+  ) %>% 
+  filter(!(LOAN_ID %in% rm.LOAN_ID$LOAN_ID), LOAN_AGE >= 1) %>% 
+  arrange(LOAN_ID, MTH_RPT_PRD)
+
+```
+
+
+creating unique UPB per loan id observations to back out the correct payments and original amounts
+```{r}
+uniq.upbs =  perf.1 %>% 
+  select(LOAN_ID, LOAN_AGE, LAST_UPB) %>% 
+  # must remove loan_id's not in the filtered down acq table 
+  inner_join(acq.df %>% select(LOAN_ID, STATE, ORIG_AMT, ORIG_RT, ORIG_TRM), by = c("LOAN_ID" = "LOAN_ID")) %>% 
+  filter(!is.na(LAST_UPB) & LOAN_AGE == 7) %>%
+  mutate(ORIG_TRM = as.numeric(as.character(ORIG_TRM)),
+         ORIG_RT = ORIG_RT/100) %>% 
+  distinct(LOAN_ID, .keep_all = T) %>% 
+  mutate(CRRCT_PMT_AMT = (LAST_UPB * (ORIG_RT/12)) / (1 - ((1 + (ORIG_RT/12) )^(-(ORIG_TRM-LOAN_AGE-1)))),         #-1 because it is last upb
+         CRRCT_ORIG_AMT = CRRCT_PMT_AMT*((1/(ORIG_RT/12)) - (1/ ((ORIG_RT/12)*((1+(ORIG_RT/12))^ORIG_TRM))))
+         )
+```
+
+
+joining back determined ID's to identify actual UPBs  and finalizing feature engineering in performance dataset
+```{r}
+perf.df <- perf.1 %>% 
+  #removing observations that will be removed from the filter in uniq.upbs
+  inner_join(uniq.upbs %>% select(LOAN_ID, STATE, ORIG_AMT, ORIG_RT, ORIG_TRM, CRRCT_PMT_AMT, CRRCT_ORIG_AMT), by = c("LOAN_ID" = "LOAN_ID")) %>%
+  #select(LOAN_ID, LOAN_AGE, ORIG_TRM, ORIG_RT, LAST_UPB, ORIG_AMT, CRRCT_ORIG_AMT, CRRCT_PMT_AMT) %>% 
+  mutate(ORIG_TRM = as.numeric(as.character(ORIG_TRM)),
+         LAST_RT = LAST_RT/100) %>% 
+  mutate(LAST_UPB = ifelse(is.na(LAST_UPB),
+                           (CRRCT_PMT_AMT * (1 - ( (1 + (ORIG_RT/12))^(-(ORIG_TRM-LOAN_AGE-1))) ) )/(ORIG_RT/12),
+                           LAST_UPB),
+         TRML_STAT = ifelse(ZB_CODE == 01, "Prepay_Matured", 
+                            ifelse(ZB_CODE == 16, "Prepaid",
+                                   # can be more conservative with just "< 2"
+                                   ifelse(ZB_CODE == 06 & lag(DLQ_STAT) <= 2 , "Prepay_Matured", "Default"))),
+         DLQ_STAT = ifelse(DLQ_STAT == 999 & (TRML_STAT == "Prepay_Matured" | TRML_STAT == "Prepaid"), 0, 
+                            ifelse(DLQ_STAT == 999 & TRML_STAT == "Default", 
+                                   lag(DLQ_STAT)+1, DLQ_STAT)),
+         CURR_UPB = (CRRCT_PMT_AMT * (1 - ( (1 + (ORIG_RT/12))^(-(ORIG_TRM-LOAN_AGE-1))) ) )/(ORIG_RT/12),
+         CURR_STAT = factor(ifelse(DLQ_STAT > 1, "Default", 
+                                   #if last upb is less than scheduled (CURR_UPB) by at least $2, then "Prepay"
+                                   ifelse(DLQ_STAT == 0 & (LAST_UPB - CURR_UPB) < -2, 
+                                          "Prepay", "Current")), 
+                            levels = c("Default", "Current", "Prepay")),
+         CUM_PP_PCT = ifelse(round(CURR_UPB, 0) == 0, 0, ((CURR_UPB - LAST_UPB)/CURR_UPB)*100), 
+         AGE_MAT_RATIO = LOAN_AGE/ORIG_TRM) %>%
+  filter(MOD_FLAG != "Y") %>% 
+  select(LOAN_ID, STATE, MTH_RPT_PRD, ORIG_TRM, LOAN_AGE, AGE_MAT_RATIO, LAST_RT, LAST_UPB, 
+         ORIG_RT, ORIG_AMT, CRRCT_ORIG_AMT, CRRCT_PMT_AMT, CURR_UPB,  
+         CUM_PP_PCT, ZB_CODE, DLQ_STAT, TRML_STAT, CURR_STAT) %>% 
+  fill(ZB_CODE, TRML_STAT, .direction = "up")
+
+```
+
+##################################################################
+##################### Merge All Data Sets ########################
+##################################################################
+
+Entire Chunk take approximately: Time difference of 2.242169 mins
+```{r}
+#comment out if not needed
+#rm(perf.raw)
+
+comb.df = perf.df %>% 
+  #merge the Division per State
+  left_join(str.df, by = c("STATE" = "State")) %>% 
+  rename(DIVISION = Division) %>% 
+  #join HPI data
+  left_join(hpi.df, by = c("MTH_RPT_PRD" = "Date")) %>% 
+  #Create the relevant nonseasonal and seasonal HPI per Division/observation
+  mutate(DIVISION = ifelse(STATE %in% c("PR", "VI"), "USA", DIVISION),
+         DIV_HPI_NSA = case_when(
+           DIVISION == "East_North_Central" ~ East_North_Central_NSA,
+           DIVISION == "East_South_Central" ~ East_South_Central_NSA,
+           DIVISION == "Middle_Atlantic" ~ Middle_Atlantic_NSA,
+           DIVISION == "Mountain" ~ Mountain_NSA,
+           DIVISION == "New_England" ~ New_England_NSA,
+           DIVISION == "Pacific" ~ Pacific_NSA,
+           DIVISION == "South_Atlantic" ~ South_Atlantic_NSA,
+           DIVISION == "West_North_Central" ~ West_North_Central_NSA,
+           DIVISION == "West_South_Central" ~ West_South_Central_NSA, 
+           DIVISION == "USA" ~ USA_NSA),
+         DIV_HPI_SA = case_when(
+           DIVISION == "East_North_Central" ~ East_North_Central_SA,
+           DIVISION == "East_South_Central" ~ East_South_Central_SA,
+           DIVISION == "Middle_Atlantic" ~ Middle_Atlantic_SA,
+           DIVISION == "Mountain" ~ Mountain_SA,
+           DIVISION == "New_England" ~ New_England_SA,
+           DIVISION == "Pacific" ~ Pacific_SA,
+           DIVISION == "South_Atlantic" ~ South_Atlantic_SA,
+           DIVISION == "West_North_Central" ~ West_North_Central_SA,
+           DIVISION == "West_South_Central" ~ West_South_Central_SA,
+           DIVISION == "USA" ~ USA_SA)
+  ) %>% 
+  #remove all columns not needed such as West_North_Central_NSA, West_North_Central_SA
+  select(-one_of(names(hpi.df[,2:(dim(hpi.df)[2]-2)]))) %>%
+  #merge interest rate table
+  left_join(ir.df, by = c("MTH_RPT_PRD" = "Date")) %>% 
+  #create the relevant index mortgage interest rate applied to each loan
+  mutate(FRM_TRM = case_when(
+    ORIG_TRM == "120" ~ FRM10, 
+    ORIG_TRM == "180" ~ FRM15,
+    ORIG_TRM == "240" ~ FRM20,
+    ORIG_TRM == "300" ~ FRM25,
+    ORIG_TRM == "360" ~ FRM30)) %>% 
+  #remove unneeded columns from interest rate 
+  select(-one_of(names(ir.df[, 2:dim(ir.df)[2]]))) %>% 
+  #shouldn't have to do inner join - but time difference essentially the same
+  inner_join(acq.df %>% select(-STATE, -ORIG_TRM,-ORIG_RT, -ORIG_AMT), by = c("LOAN_ID", "LOAN_ID")) %>% 
+  group_by(LOAN_ID) %>% 
+  mutate(USA_NSA = (USA_NSA - lag(USA_NSA))/lag(USA_NSA), 
+         USA_SA = (USA_SA - lag(USA_SA))/lag(USA_SA),
+         DIV_HPI_NSA = (DIV_HPI_NSA - lag(DIV_HPI_NSA))/lag(DIV_HPI_NSA), 
+         DIV_HPI_SA = (DIV_HPI_SA - lag(DIV_HPI_SA))/lag(DIV_HPI_SA)
+  ) %>% 
+  #need to fill these values, but takes up too much time with fill() - in the hours not even minutes
+  #fill(USA_NSA, USA_SA, DIV_HPI_NSA, DIV_HPI_SA, .direction = "up") %>% 
+  #ifelse method only adds .7 minutes more to run time
+  mutate(USA_NSA = ifelse(is.na(USA_NSA), lead(USA_NSA), USA_NSA), 
+         USA_SA = ifelse(is.na(USA_SA), lead(USA_SA), USA_SA),
+         DIV_HPI_NSA = ifelse(is.na(DIV_HPI_NSA), lead(DIV_HPI_NSA), DIV_HPI_NSA),
+         DIV_HPI_SA = ifelse(is.na(DIV_HPI_SA), lead(DIV_HPI_SA), DIV_HPI_SA)) %>% 
+  #organize columns into a more user friendly and logical order
+  select(LOAN_ID, STATE, DIVISION, MTH_RPT_PRD, LOAN_AGE, AGE_MAT_RATIO,
+         CSCORE_B, CSCORE_C, FICO_B, FICO_C, OCLTV, OLTV, FINAL_LTV, DTI, MI_PCT,
+         FTHB_FLG, PURPOSE, OCC_STAT, NUM_BO, NUM_UNIT, RELOCATION_FLG,
+         ORIG_TRM, ORIG_RT, ORIG_AMT, LAST_RT, LAST_UPB, 
+         CRRCT_ORIG_AMT, CRRCT_PMT_AMT, CURR_UPB, CUM_PP_PCT,
+         ZB_CODE, DLQ_STAT, TRML_STAT, CURR_STAT,
+         USA_NSA, USA_SA, DIV_HPI_NSA, DIV_HPI_SA, FRM_TRM) 
+
+```
+
+Writing and savings r data objects
+```{r}
+#Writing Raw Files
+saveRDS(acq.raw, file = "../Data/RData/acq.raw")
+saveRDS(perf.raw, file = "../Data/RData/perf.raw")
+saveRDS(ir.df, file = "../Data/RData/ir.df")
+saveRDS(str.df, file = "../Data/RData/str.df")
+saveRDS(hpi.df, file = "../Data/RData/hpi.df")
+
+#Writing Intermediate Data Files
+saveRDS(acq.df, file = "../Data/RData/acq.df")
+saveRDS(perf.df, file = "../Data/RData/perf.df")
+
+#Writing Final Dataset
+saveRDS(comb.df, file = "../Data/RData/comb.df")
+```
+
